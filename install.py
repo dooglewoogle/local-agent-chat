@@ -21,7 +21,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent
 HOME = Path.home()
 
-BACKUP = ".chatroom-bak"
+# Backups mirror their path under $HOME here. Not next to the original: Claude Code
+# and Codex load every directory under skills/ as a skill, backups included.
+BACKUP_ROOT = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local" / "share") / "chatroom" / "backup"
 CLAUDE_RULE = "Bash(chatroom:*)"
 CODEX_RULE = 'prefix_rule(pattern=["chatroom"], decision="allow")'
 BEGIN, END = "<!-- chatroom:begin -->", "<!-- chatroom:end -->"
@@ -36,6 +38,14 @@ Other coding agents on this machine coordinate through a file-based chatroom. At
 def short(p) -> str:
     s = str(p)
     return "~" + s[len(str(HOME)):] if s.startswith(str(HOME) + os.sep) else s
+
+
+def backup_path(p: Path) -> Path:
+    try:
+        rel = p.relative_to(HOME)
+    except ValueError:
+        rel = Path("root", *p.parts[1:])
+    return BACKUP_ROOT / rel
 
 
 class Installer:
@@ -72,8 +82,9 @@ class Installer:
         if self.dry:
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        backup = path.with_name(path.name + BACKUP)
+        backup = backup_path(path)
         if path.exists() and not backup.exists():
+            backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(path, backup)
         tmp = path.with_name(f".{path.name}.chatroom-tmp")
         tmp.write_text(text)
@@ -95,13 +106,14 @@ class Installer:
                 dst.symlink_to(src)
             return self.changed(dst, f"-> {short(src)} (was -> {old})")
         if dst.exists():
-            backup = dst.with_name(dst.name + BACKUP)
+            backup = backup_path(dst)
             if not (backup_dirs and dst.is_dir()) or backup.exists():
                 return self.todo(dst, f"exists and is not a symlink; move it away, then re-run (wanted -> {short(src)})")
             if not self.dry:
-                dst.rename(backup)
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(dst), str(backup))
                 dst.symlink_to(src)
-            return self.changed(dst, f"-> {short(src)} (old directory kept as {backup.name})")
+            return self.changed(dst, f"-> {short(src)} (old directory moved to {short(backup)})")
         if not self.dry:
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.symlink_to(src)
@@ -110,12 +122,13 @@ class Installer:
     def unlink(self, dst: Path, src: Path):
         if not dst.is_symlink() or dst.resolve() != src.resolve():
             return self.ok(dst, "not linked to this repo")
-        backup = dst.with_name(dst.name + BACKUP)
+        backup = backup_path(dst)
+        restore = backup.is_dir()
         if not self.dry:
             dst.unlink()
-            if backup.is_dir():
-                backup.rename(dst)
-        self.changed(dst, "removed" + (f", restored {backup.name}" if backup.is_dir() else ""))
+            if restore:
+                shutil.move(str(backup), str(dst))
+        self.changed(dst, "removed" + (f", restored the directory from {short(backup)}" if restore else ""))
 
     # --- steps ---
 

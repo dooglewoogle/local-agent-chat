@@ -172,7 +172,7 @@ def snapshot(root: Path) -> dict:
     out = {}
     for p in sorted(root.rglob("*")):
         rel = str(p.relative_to(root))
-        if ".chatroom-bak" in rel:
+        if rel.startswith(".local/share/chatroom/backup"):
             continue
         if p.is_symlink():
             out[rel] = ("link", os.readlink(p))
@@ -188,7 +188,8 @@ class InstallerTest(ChatroomTestCase):
         self.home.mkdir()
 
     def install(self, *args):
-        env = dict(os.environ, HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / ".config"))
+        env = dict(os.environ, HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / ".config"),
+                   XDG_DATA_HOME=str(self.home / ".local" / "share"))
         r = subprocess.run([sys.executable, str(self.root / "install.py"), *args],
                            capture_output=True, text=True, env=env, timeout=30)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -259,6 +260,10 @@ class InstallerTest(ChatroomTestCase):
 
         self.install()
         self.assertTrue((self.home / ".claude" / "skills" / "local-chatroom").is_symlink())
+        # The replaced skill dir must not stay under skills/, or it loads as a second skill.
+        self.assertEqual([p.name for p in (self.home / ".claude" / "skills").iterdir()], ["local-chatroom"])
+        backup = self.home / ".local" / "share" / "chatroom" / "backup" / ".claude" / "skills" / "local-chatroom"
+        self.assertEqual((backup / "SKILL.md").read_text(), "hand-made skill")
         self.assertNotEqual(snapshot(self.home), before)
         self.install("--uninstall")
         self.assertEqual(snapshot(self.home), before)
