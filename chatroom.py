@@ -134,12 +134,30 @@ def detect_agent():
     )
 
 
-def validate_name(name: str) -> str:
-    """Names become file names; keep them path-safe."""
-    if not name or name in (".", "..") or "/" in name or "\x00" in name:
-        print(f"Invalid name '{name}': must be non-empty and contain no '/'.", file=sys.stderr)
+def is_valid_name(name: str) -> bool:
+    """Agent and room names become file names, so keep them path-safe. '--' is
+    reserved: it separates the two parties in a DM file name."""
+    return bool(name) and name not in (".", "..") and not any(s in name for s in ("/", "\x00", "--"))
+
+
+def validate_name(name: str, kind: str = "name") -> str:
+    if not is_valid_name(name):
+        print(f"Invalid {kind} '{name}': must be non-empty and contain no '/' or '--'.", file=sys.stderr)
         sys.exit(1)
     return name
+
+
+def require_room(room: str) -> str:
+    validate_name(room, "room")
+    if not room_path(room).is_dir():
+        print(f"Room '{room}' does not exist. Create it with: chatroom create-room --room {room}", file=sys.stderr)
+        sys.exit(1)
+    return room
+
+
+def mention_pattern(name: str):
+    """Match `name` or `@name` as a whole name: 'doug' matches neither 'dougal' nor 'sony-doug'."""
+    return re.compile(r"(?<![\w-])@?" + re.escape(name) + r"(?![\w-])", re.IGNORECASE)
 
 
 def append_jsonl(path: Path, entry: dict) -> None:
@@ -342,7 +360,7 @@ def cmd_join(args):
 
 
 def cmd_leave(args):
-    p = presence_path(args.name)
+    p = presence_path(validate_name(args.name))
     if p.exists():
         p.unlink()
         print(f"'{args.name}' left the chatroom.")
@@ -353,11 +371,7 @@ def cmd_leave(args):
 
 def cmd_send(args):
     ensure_dirs()
-    room = args.room
-    rp = room_path(room)
-    if not rp.exists():
-        print(f"Room '{room}' does not exist. Create it with: chatroom.py create-room --room {room}", file=sys.stderr)
-        sys.exit(1)
+    room = require_room(args.room)
 
     entry = {
         "sender": validate_name(args.name),
@@ -397,8 +411,8 @@ def cmd_dm(args):
 def cmd_dm_poll(args):
     """Poll for DMs with a specific agent or all DMs."""
     ensure_dirs()
-    name = args.name
-    partner = args.with_agent
+    name = validate_name(args.name)
+    partner = args.with_agent and validate_name(args.with_agent)
 
     if partner:
         # Poll a specific DM conversation
@@ -424,15 +438,22 @@ def cmd_dm_poll(args):
 
 
 def _read_messages(mp):
-    """Read all messages from a messages.jsonl file."""
+    """Read all messages from a jsonl file. Lines that do not parse as a message
+    (a write in progress, a hand edit) are skipped rather than fatal."""
     messages = []
     if not mp.exists():
         return messages
     with open(mp, "r") as f:
         for line in f:
             line = line.strip()
-            if line:
-                messages.append(json.loads(line))
+            if not line:
+                continue
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(m, dict) and {"sender", "ts", "message"} <= m.keys():
+                messages.append(m)
     return messages
 
 
@@ -452,9 +473,8 @@ def _poll_file(mp, args, label="room"):
     if getattr(args, "since", None) is not None:
         messages = [m for m in messages if m["ts"] > args.since]
 
-    if getattr(args, "mentions", None):
-        mention_name = args.mentions
-        pattern = re.compile(r"@?" + re.escape(mention_name), re.IGNORECASE)
+    pattern = mention_pattern(args.mentions) if getattr(args, "mentions", None) else None
+    if pattern:
         messages = [m for m in messages if pattern.search(m["message"])]
 
     if args.last is not None:
@@ -488,8 +508,7 @@ def _poll_file(mp, args, label="room"):
             fresh = _read_messages(mp)
             new = [m for m in fresh if m["ts"] > watermark]
 
-            if getattr(args, "mentions", None):
-                pattern = re.compile(r"@?" + re.escape(args.mentions), re.IGNORECASE)
+            if pattern:
                 new = [m for m in new if pattern.search(m["message"])]
 
             if new:
@@ -503,7 +522,8 @@ def _poll_file(mp, args, label="room"):
 
 
 def cmd_poll(args):
-    room = args.room
+    ensure_dirs()
+    room = require_room(args.room)
     if args.last is None:
         # A mentions check-in wants a short digest; a full read wants more history.
         args.last = 5 if args.mentions else 20
@@ -544,7 +564,7 @@ def cmd_rooms(_args):
 
 def cmd_create_room(args):
     ensure_dirs()
-    rp = room_path(args.room)
+    rp = room_path(validate_name(args.room, "room"))
     if rp.exists():
         print(f"Room #{args.room} already exists.")
         return
@@ -560,7 +580,7 @@ def cmd_search(args):
     results = []
 
     if args.room:
-        rooms_to_search = [args.room]
+        rooms_to_search = [validate_name(args.room, "room")]
     else:
         rooms_to_search = list_rooms()
 
@@ -651,6 +671,8 @@ def main():
     p_dmpoll.add_argument("--name", required=True, help="Your agent name")
     p_dmpoll.add_argument("--with", dest="with_agent", help="Filter to DMs with this agent")
     p_dmpoll.add_argument("--last", type=int, default=20, help="Show last N messages (default: 20)")
+    p_dmpoll.add_argument("--timeout", type=int, default=100, help="With --with: how long to wait for new messages in seconds (default: 100)")
+    p_dmpoll.add_argument("--no-wait", action="store_true", help="With --with: return immediately instead of blocking")
 
     # poll
     p_poll = sub.add_parser("poll", help="Read messages from a room (blocks for new messages by default)")
