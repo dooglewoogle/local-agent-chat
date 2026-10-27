@@ -104,12 +104,24 @@ def mention_pattern(name: str):
     return re.compile(r"(?<![\w-])@?" + re.escape(name) + r"(?![\w-])", re.IGNORECASE)
 
 
+def name_file() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "chatroom" / "name"
+
+
 def default_human_name() -> str:
-    """Display name for the UI: $CHATROOM_NAME, else the login name."""
-    try:
-        return os.environ.get("CHATROOM_NAME") or getpass.getuser()
-    except (KeyError, OSError):
-        return "human"
+    """Display name for the UI: $CHATROOM_NAME, else ~/.config/chatroom/name, else the login name."""
+    name = os.environ.get("CHATROOM_NAME")
+    if not name:
+        try:
+            name = name_file().read_text().strip()
+        except OSError:
+            pass
+    if not name:
+        try:
+            name = getpass.getuser()
+        except (KeyError, OSError):
+            name = "human"
+    return name
 
 
 # --- Storage ---

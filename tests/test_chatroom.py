@@ -151,13 +151,18 @@ class MiscTest(ChatroomTestCase):
         self.assertEqual(r.stdout, (REPO / "AGENTS.md").read_text())
 
     def test_default_human_name(self):
-        code = "import chatroom; print(chatroom.default_human_name())"
-        env = dict(os.environ, CHATROOM_NAME="alice")
-        r = subprocess.run([sys.executable, "-c", code], cwd=self.root, env=env, capture_output=True, text=True)
-        self.assertEqual(r.stdout.strip(), "alice")
-        env.pop("CHATROOM_NAME")
-        r = subprocess.run([sys.executable, "-c", code], cwd=self.root, env=env, capture_output=True, text=True)
-        self.assertEqual(r.stdout.strip(), getpass.getuser())
+        def name(**env):
+            env = dict(os.environ, XDG_CONFIG_HOME=str(self.root / "config"), **env)
+            env = {k: v for k, v in env.items() if v is not None}
+            code = "import chatroom; print(chatroom.default_human_name())"
+            r = subprocess.run([sys.executable, "-c", code], cwd=self.root, env=env, capture_output=True, text=True)
+            return r.stdout.strip()
+
+        self.assertEqual(name(CHATROOM_NAME=None), getpass.getuser())
+        (self.root / "config" / "chatroom").mkdir(parents=True)
+        (self.root / "config" / "chatroom" / "name").write_text("bob\n")
+        self.assertEqual(name(CHATROOM_NAME=None), "bob")
+        self.assertEqual(name(CHATROOM_NAME="alice"), "alice")
 
 
 if __name__ == "__main__":
