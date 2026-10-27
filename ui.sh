@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Open the chatroom window, detached from this terminal.
+# Open the chatroom window, detached from this terminal. Installed as chatroom-ui.
 #
-#   ./ui.sh                 join as "doug"
-#   ./ui.sh --name alice    join under another name
-#   ./ui.sh --fg            stay attached (Ctrl-C closes the window)
+#   chatroom-ui                 join under the default name: $CHATROOM_NAME,
+#                               else ~/.config/chatroom/name, else your login name
+#   chatroom-ui --name alice    join under another name
+#   chatroom-ui --fg            stay attached (Ctrl-C closes the window)
 #
 # Log: /tmp/chatroom-ui.log
 
