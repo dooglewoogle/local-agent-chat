@@ -59,6 +59,34 @@ def pid_alive(pid) -> bool:
 KNOWN_AGENTS = {"claude", "codex", "hermes", "aider", "gemini", "opencode", "goose", "amp"}
 SHELLS = {"bash", "sh", "zsh", "dash", "fish", "rtk"}
 STOP = {"tmux", "tmux: server", "sshd", "systemd", "init", "login"}
+# Environment variables that identify a harness even when its process is not visible.
+# Checked in order. Variables a harness sets fresh for its own session (Codex) come
+# before ones that are inherited by any child process (CLAUDECODE), so a Codex
+# session launched from inside Claude Code is still labelled codex.
+ENV_HINTS = [("CODEX_SESSION_ID", "codex"), ("CODEX_THREAD_ID", "codex"), ("HERMES_SESSION_ID", "hermes"),
+             ("AIDER_MODEL", "aider"), ("CLAUDECODE", "claude")]
+
+
+def env_agent_label():
+    for var, label in ENV_HINTS:
+        if os.environ.get(var):
+            return label
+    return None
+
+
+def label_from_comm(comm: str):
+    """'codex-linux-sandbox' -> 'codex'. Used for pid 1 inside a sandbox namespace."""
+    for label in sorted(KNOWN_AGENTS, key=len, reverse=True):
+        if comm == label or comm.startswith(label + "-"):
+            return label
+    return None
+
+
+def sandbox_agent_label():
+    try:
+        return label_from_comm(Path("/proc/1/comm").read_text().strip())
+    except OSError:
+        return None
 
 
 def _ancestors():
@@ -82,7 +110,13 @@ def detect_agent():
     Otherwise the nearest ancestor that is not a shell or python is adopted,
     unless it is a session-level process (tmux, sshd, ...), in which case we
     fall back to the parent pid and return a warning.
+
+    Inside a PID namespace (Codex sandbox) no host pid exists; pid is None and
+    the label comes from the environment. Such presence expires by PRESENCE_TTL.
     """
+    env_label = env_agent_label()
+    if not pids_visible():
+        return None, sandbox_agent_label() or env_label or "sandboxed", None
     chain = list(_ancestors())
     for pid, comm in chain:
         if comm in KNOWN_AGENTS:
@@ -92,10 +126,10 @@ def detect_agent():
             continue
         if comm in STOP or pid == 1:
             break
-        return pid, comm, None
+        return pid, env_label or comm, None
     return (
         os.getppid(),
-        "unknown",
+        env_label or "unknown",
         "could not identify the agent process; pass --pid <pid of your agent> so presence outlives this shell",
     )
 
@@ -128,6 +162,17 @@ def write_presence(data: dict) -> Path:
     return p
 
 
+def touch_presence(name: str) -> None:
+    """Refresh last_seen for `name` if it has a presence record. Best effort."""
+    p = presence_path(name)
+    try:
+        data = json.loads(p.read_text())
+        data["last_seen"] = time.time()
+        write_presence(data)
+    except (OSError, ValueError):
+        pass
+
+
 def read_presence(alive_only: bool = False) -> list:
     """Return presence records as dicts. Never reaps; skips unparsable files."""
     members = []
@@ -136,7 +181,7 @@ def read_presence(alive_only: bool = False) -> list:
             data = json.loads(f.read_text())
         except (json.JSONDecodeError, OSError):
             continue
-        if alive_only and not pid_alive(data.get("pid")):
+        if alive_only and not presence_alive(data):
             continue
         members.append(data)
     return members
@@ -147,19 +192,44 @@ def list_rooms() -> list:
     return sorted(d.name for d in ROOMS_DIR.iterdir() if d.is_dir())
 
 
+# A presence record without a host pid (sandboxed harness) expires this long
+# after its last activity. join/send/dm refresh last_seen.
+PRESENCE_TTL = 3 * 3600
+
+
+def pids_visible() -> bool:
+    """False inside a PID namespace (Codex sandbox, containers): host pids are invisible there,
+    so pid-based liveness checks would wrongly report every other agent as dead."""
+    try:
+        return Path("/proc/1/comm").read_text().strip() in ("systemd", "init")
+    except OSError:
+        return False
+
+
+def presence_alive(data: dict) -> bool:
+    pid = data.get("pid")
+    if pid:
+        if not pids_visible():
+            return True  # cannot judge from inside a sandbox; leave it alone
+        return pid_alive(pid)
+    last = data.get("last_seen") or data.get("joined_at") or 0
+    return (time.time() - last) < PRESENCE_TTL
+
+
 def reap_dead_agents():
-    """Remove presence files for dead agent processes. Returns list of reaped names."""
+    """Remove presence files for dead agents. Returns list of reaped names."""
     reaped = []
     for f in PRESENCE_DIR.glob("*.json"):
         try:
-            data = json.loads(f.read_text())
-            if not pid_alive(data["pid"]):
-                name = f.stem
+            dead = not presence_alive(json.loads(f.read_text()))
+        except (json.JSONDecodeError, OSError):
+            dead = True
+        if dead:
+            try:
                 f.unlink()
-                reaped.append(name)
-        except (json.JSONDecodeError, KeyError, OSError):
-            f.unlink()
-            reaped.append(f.stem)
+                reaped.append(f.stem)
+            except OSError:
+                pass
     return reaped
 
 
@@ -258,9 +328,15 @@ def cmd_join(args):
         "pid": agent_pid,
         "project": str(Path(args.project).resolve()),
         "joined_at": time.time(),
+        "last_seen": time.time(),
     }
     write_presence(data)
-    print(f"Joined as '{name}' (agent={agent}, PID {agent_pid}, project: {data['project']})")
+    if agent_pid:
+        print(f"Joined as '{name}' (agent={agent}, PID {agent_pid}, project: {data['project']})")
+    else:
+        hours = PRESENCE_TTL // 3600
+        print(f"Joined as '{name}' (agent={agent}, sandboxed: no host pid visible, project: {data['project']})")
+        print(f"Note: presence expires {hours}h after your last send/dm/join; re-join if you go quiet for longer.")
     if warning:
         print(f"Warning: {warning}", file=sys.stderr)
 
@@ -289,6 +365,7 @@ def cmd_send(args):
         "message": args.message,
     }
     append_jsonl(messages_path(room), entry)
+    touch_presence(entry["sender"])
 
     ts_str = datetime.fromtimestamp(entry["ts"]).strftime("%H:%M:%S")
     print(f"[{ts_str}] Sent to #{room}")
@@ -311,6 +388,7 @@ def cmd_dm(args):
         "message": args.message,
     }
     append_jsonl(dm_path(args.name, target), entry)
+    touch_presence(entry["sender"])
 
     ts_str = datetime.fromtimestamp(entry["ts"]).strftime("%H:%M:%S")
     print(f"[{ts_str}] DM sent to {target}")
@@ -443,7 +521,7 @@ def cmd_members(_args):
 
     for data in members:
         joined = datetime.fromtimestamp(data.get("joined_at", 0)).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"  {data.get('name', '?')}  agent={data.get('agent', '?')}  pid={data.get('pid', '?')}  project={data.get('project', '?')}  joined={joined}")
+        print(f"  {data.get('name', '?')}  agent={data.get('agent', '?')}  pid={data.get('pid') or '-'}  project={data.get('project', '?')}  joined={joined}")
 
 
 def cmd_rooms(_args):
@@ -512,6 +590,16 @@ def cmd_search(args):
         else:
             src = f"#{m.get('_room', '?')} {m['sender']}"
         print(f"[{ts_str}] {src}: {m['message']}")
+
+
+def cmd_reap(_args):
+    """Remove stale presence files (used by reaper.sh from cron)."""
+    ensure_dirs()
+    if not pids_visible():
+        print("Skipping: host pids are not visible from here (sandbox).", file=sys.stderr)
+        return
+    for name in reap_dead_agents():
+        print(f"Reaped stale agent: {name}")
 
 
 def cmd_ui(args):
@@ -585,6 +673,9 @@ def main():
     p_cr = sub.add_parser("create-room", help="Create a new room")
     p_cr.add_argument("--room", required=True, help="Room name")
 
+    # reap
+    sub.add_parser("reap", help="Remove presence files of dead or expired agents")
+
     # ui
     p_ui = sub.add_parser("ui", help="Open the Tk chat window (for humans)")
     p_ui.add_argument("--name", default="doug", help="Your display name (default: doug)")
@@ -605,6 +696,7 @@ def main():
         "members": cmd_members,
         "rooms": cmd_rooms,
         "create-room": cmd_create_room,
+        "reap": cmd_reap,
         "ui": cmd_ui,
     }
     commands[args.command](args)

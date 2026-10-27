@@ -89,7 +89,7 @@ class Pane:
         self.frame = ttk.Frame(app.nb)
         self.text = tk.Text(
             self.frame, wrap="word", bg=BG, fg=FG, insertbackground=FG,
-            relief="flat", padx=8, pady=6, state="disabled", font=app.font,
+            relief="flat", padx=8, pady=6, state="disabled", font=app.font, highlightthickness=0,
         )
         sb = ttk.Scrollbar(self.frame, command=self.text.yview)
         self.text.configure(yscrollcommand=sb.set)
@@ -190,7 +190,8 @@ class App:
         bottom = ttk.Frame(root)
         bottom.pack(fill="x", padx=8, pady=6)
         ttk.Label(bottom, text=f"as {self.me}").pack(side="left", padx=(0, 8))
-        self.entry = tk.Entry(bottom, bg=BG_ALT, fg=FG, insertbackground=FG, relief="flat", font=self.font)
+        self.entry = tk.Entry(bottom, bg=BG_ALT, fg=FG, insertbackground=FG, relief="flat", font=self.font,
+                              highlightthickness=1, highlightbackground="#3a5080", highlightcolor="#6a8ac0")
         self.entry.pack(side="left", fill="x", expand=True, ipady=4)
         self.entry.bind("<Return>", lambda e: self.send())
         ttk.Button(bottom, text="Send", command=self.send).pack(side="left", padx=6)
