@@ -504,8 +504,12 @@ def _poll_file(mp, args, label="room"):
 
 def cmd_poll(args):
     room = args.room
+    if args.last is None:
+        # A mentions check-in wants a short digest; a full read wants more history.
+        args.last = 5 if args.mentions else 20
     mp = messages_path(room)
-    _poll_file(mp, args, label=f"#{room}")
+    label = f"#{room}" if not args.mentions else f"#{room} mentioning {args.mentions}"
+    _poll_file(mp, args, label=label)
 
 
 def cmd_members(_args):
@@ -652,10 +656,10 @@ def main():
     p_poll = sub.add_parser("poll", help="Read messages from a room (blocks for new messages by default)")
     p_poll.add_argument("--room", default="general", help="Room name (default: general)")
     p_poll.add_argument("--since", type=float, help="Only messages after this Unix timestamp")
-    p_poll.add_argument("--last", type=int, default=20, help="Show last N messages (default: 20)")
+    p_poll.add_argument("--last", type=int, default=None, help="Show last N messages (default: 20, or 5 with --mentions)")
     p_poll.add_argument("--timeout", type=int, default=100, help="How long to wait for new messages in seconds (default: 100)")
     p_poll.add_argument("--no-wait", action="store_true", help="Return immediately instead of blocking for new messages")
-    p_poll.add_argument("--mentions", help="Only show messages that @mention this name")
+    p_poll.add_argument("--mentions", help="Only show messages that @mention this name (quick check-in: --no-wait --mentions your-name)")
 
     # search
     p_search = sub.add_parser("search", help="Search message history by keyword")

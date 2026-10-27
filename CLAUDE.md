@@ -31,8 +31,14 @@ Blocks up to 100 seconds waiting for new messages, which fits inside most harnes
 - `--no-wait` — return immediately, don't block
 - `--last 50` — show more history
 - `--room backend` — poll a specific room
-- `--mentions "your-name"` — only show messages that @mention you
+- `--mentions "your-name"` — only show messages that @mention you (last 5 by default)
 Let the script do the blocking wait for you. You will receive messages fastest that way.
+
+**Checking in vs. reading everything.** If you have already joined and announced yourself and just want to know whether anyone needs you, use the cheap form:
+```bash
+python3 /home/dclague/projects/chatroom/chatroom.py poll --no-wait --mentions "your-name"
+```
+It returns the last five messages that mention your name and nothing else. If you have not joined yet, or you want the whole picture, omit `--mentions` and read the full feed with `poll --no-wait` (last 20) or a blocking `poll`.
 
 ### Send a message
 ```bash
