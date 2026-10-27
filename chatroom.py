@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Agent chatroom — file-based messaging for Claude Code instances."""
+"""Agent chatroom — file-based messaging for coding agents (Claude Code, Codex, Hermes, ...)."""
 
 import argparse
 import ctypes
@@ -44,7 +44,9 @@ def dm_path(a: str, b: str) -> Path:
     return DM_DIR / f"{pair[0]}--{pair[1]}.jsonl"
 
 
-def pid_alive(pid: int) -> bool:
+def pid_alive(pid) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
     try:
         os.kill(pid, 0)
         return True
@@ -52,19 +54,97 @@ def pid_alive(pid: int) -> bool:
         return False
 
 
-def find_ancestor_pid(name: str = "claude") -> int:
-    """Walk up the process tree to find the nearest ancestor matching `name`."""
+# Process names (comm) of harnesses we recognise, shells we skip when walking
+# up the tree, and session-level processes we must never adopt as "the agent".
+KNOWN_AGENTS = {"claude", "codex", "hermes", "aider", "gemini", "opencode", "goose", "amp"}
+SHELLS = {"bash", "sh", "zsh", "dash", "fish", "rtk"}
+STOP = {"tmux", "tmux: server", "sshd", "systemd", "init", "login"}
+
+
+def _ancestors():
+    """Yield (pid, comm) for each ancestor of this process, nearest first."""
     pid = os.getpid()
     try:
         while pid > 1:
-            ppid = int(open(f"/proc/{pid}/stat").read().split()[3])
+            stat = open(f"/proc/{pid}/stat").read()
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
             comm = open(f"/proc/{ppid}/comm").read().strip()
-            if comm == name:
-                return ppid
+            yield ppid, comm
             pid = ppid
-    except (FileNotFoundError, ProcessLookupError, ValueError):
-        pass
-    return os.getppid()
+    except (FileNotFoundError, ProcessLookupError, ValueError, IndexError):
+        return
+
+
+def detect_agent():
+    """Find the harness process that owns this session.
+
+    Returns (pid, agent_label, warning). A known agent is matched by comm name.
+    Otherwise the nearest ancestor that is not a shell or python is adopted,
+    unless it is a session-level process (tmux, sshd, ...), in which case we
+    fall back to the parent pid and return a warning.
+    """
+    chain = list(_ancestors())
+    for pid, comm in chain:
+        if comm in KNOWN_AGENTS:
+            return pid, comm, None
+    for pid, comm in chain:
+        if comm in SHELLS or comm.startswith("python"):
+            continue
+        if comm in STOP or pid == 1:
+            break
+        return pid, comm, None
+    return (
+        os.getppid(),
+        "unknown",
+        "could not identify the agent process; pass --pid <pid of your agent> so presence outlives this shell",
+    )
+
+
+def validate_name(name: str) -> str:
+    """Names become file names; keep them path-safe."""
+    if not name or name in (".", "..") or "/" in name or "\x00" in name:
+        print(f"Invalid name '{name}': must be non-empty and contain no '/'.", file=sys.stderr)
+        sys.exit(1)
+    return name
+
+
+def append_jsonl(path: Path, entry: dict) -> None:
+    """Append one JSON line under an exclusive lock, flushed before unlock."""
+    with open(path, "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.write(json.dumps(entry) + "\n")
+            f.flush()
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def write_presence(data: dict) -> Path:
+    """Atomically write a presence file (the reaper deletes unparsable ones)."""
+    p = presence_path(data["name"])
+    tmp = p.with_name(f"{p.stem}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n")
+    os.replace(tmp, p)
+    return p
+
+
+def read_presence(alive_only: bool = False) -> list:
+    """Return presence records as dicts. Never reaps; skips unparsable files."""
+    members = []
+    for f in sorted(PRESENCE_DIR.glob("*.json")):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if alive_only and not pid_alive(data.get("pid")):
+            continue
+        members.append(data)
+    return members
+
+
+def list_rooms() -> list:
+    ensure_dirs()
+    return sorted(d.name for d in ROOMS_DIR.iterdir() if d.is_dir())
 
 
 def reap_dead_agents():
@@ -154,17 +234,35 @@ def cmd_join(args):
     reaped = reap_dead_agents()
     if reaped:
         print(f"Reaped stale agents: {', '.join(reaped)}")
-    name = args.name or f"{Path(args.project).name}-{os.getpid()}"
-    agent_pid = args.pid if args.pid else find_ancestor_pid("claude")
+    name = validate_name(args.name or f"{Path(args.project).name}-{os.getpid()}")
+    warning = None
+    if args.pid:
+        agent_pid, agent = args.pid, args.agent or "unknown"
+    else:
+        agent_pid, agent, warning = detect_agent()
+        if args.agent:
+            agent = args.agent
+
+    existing = presence_path(name)
+    if existing.exists():
+        try:
+            old = json.loads(existing.read_text())
+            if old.get("pid") != agent_pid and pid_alive(old.get("pid")):
+                print(f"Warning: '{name}' is already held by a live process (PID {old['pid']}); taking it over.", file=sys.stderr)
+        except (json.JSONDecodeError, OSError):
+            pass
+
     data = {
         "name": name,
+        "agent": agent,
         "pid": agent_pid,
         "project": str(Path(args.project).resolve()),
         "joined_at": time.time(),
     }
-    p = presence_path(name)
-    p.write_text(json.dumps(data, indent=2) + "\n")
-    print(f"Joined as '{name}' (PID {data['pid']}, project: {data['project']})")
+    write_presence(data)
+    print(f"Joined as '{name}' (agent={agent}, PID {agent_pid}, project: {data['project']})")
+    if warning:
+        print(f"Warning: {warning}", file=sys.stderr)
 
 
 def cmd_leave(args):
@@ -186,17 +284,11 @@ def cmd_send(args):
         sys.exit(1)
 
     entry = {
-        "sender": args.name,
+        "sender": validate_name(args.name),
         "ts": time.time(),
         "message": args.message,
     }
-    line = json.dumps(entry) + "\n"
-
-    mp = messages_path(room)
-    with open(mp, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        f.write(line)
-        fcntl.flock(f, fcntl.LOCK_UN)
+    append_jsonl(messages_path(room), entry)
 
     ts_str = datetime.fromtimestamp(entry["ts"]).strftime("%H:%M:%S")
     print(f"[{ts_str}] Sent to #{room}")
@@ -205,7 +297,7 @@ def cmd_send(args):
 def cmd_dm(args):
     """Send a direct message to another agent."""
     ensure_dirs()
-    target = args.to
+    target = validate_name(args.to)
     # Verify target exists
     tp = presence_path(target)
     if not tp.exists():
@@ -213,18 +305,12 @@ def cmd_dm(args):
         sys.exit(1)
 
     entry = {
-        "sender": args.name,
+        "sender": validate_name(args.name),
         "to": target,
         "ts": time.time(),
         "message": args.message,
     }
-    line = json.dumps(entry) + "\n"
-
-    mp = dm_path(args.name, target)
-    with open(mp, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
-        f.write(line)
-        fcntl.flock(f, fcntl.LOCK_UN)
+    append_jsonl(dm_path(args.name, target), entry)
 
     ts_str = datetime.fromtimestamp(entry["ts"]).strftime("%H:%M:%S")
     print(f"[{ts_str}] DM sent to {target}")
@@ -350,20 +436,18 @@ def cmd_members(_args):
     if reaped:
         print(f"Reaped stale agents: {', '.join(reaped)}")
 
-    files = sorted(PRESENCE_DIR.glob("*.json"))
-    if not files:
+    members = read_presence()
+    if not members:
         print("No members online.")
         return
 
-    for f in files:
-        data = json.loads(f.read_text())
-        joined = datetime.fromtimestamp(data["joined_at"]).strftime("%Y-%m-%d %H:%M:%S")
-        print(f"  {data['name']}  pid={data['pid']}  project={data['project']}  joined={joined}")
+    for data in members:
+        joined = datetime.fromtimestamp(data.get("joined_at", 0)).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"  {data.get('name', '?')}  agent={data.get('agent', '?')}  pid={data.get('pid', '?')}  project={data.get('project', '?')}  joined={joined}")
 
 
 def cmd_rooms(_args):
-    ensure_dirs()
-    rooms = sorted(d.name for d in ROOMS_DIR.iterdir() if d.is_dir())
+    rooms = list_rooms()
     if not rooms:
         print("No rooms.")
         return
@@ -396,7 +480,7 @@ def cmd_search(args):
     if args.room:
         rooms_to_search = [args.room]
     else:
-        rooms_to_search = sorted(d.name for d in ROOMS_DIR.iterdir() if d.is_dir())
+        rooms_to_search = list_rooms()
 
     for r in rooms_to_search:
         mp = messages_path(r)
@@ -430,13 +514,20 @@ def cmd_search(args):
         print(f"[{ts_str}] {src}: {m['message']}")
 
 
+def cmd_ui(args):
+    """Open the Tk chat window for a human participant."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import chatroom_ui
+    chatroom_ui.run(name=args.name)
+
+
 # --- CLI ---
 
 
 def main():
     parser = argparse.ArgumentParser(
         prog="chatroom",
-        description="File-based chatroom for Claude Code agents.",
+        description="File-based chatroom for coding agents (Claude Code, Codex, Hermes, ...).",
     )
     sub = parser.add_subparsers(dest="command")
 
@@ -444,7 +535,8 @@ def main():
     p_join = sub.add_parser("join", help="Register as a chatroom member")
     p_join.add_argument("--name", help="Agent name (default: <project>-<pid>)")
     p_join.add_argument("--project", default=os.getcwd(), help="Project path (default: cwd)")
-    p_join.add_argument("--pid", type=int, help="Explicit PID to track (default: auto-detect claude process)")
+    p_join.add_argument("--pid", type=int, help="Explicit PID to track (default: auto-detect the agent process)")
+    p_join.add_argument("--agent", help="Agent label, e.g. claude, codex, hermes (default: auto-detect)")
 
     # leave
     p_leave = sub.add_parser("leave", help="Unregister from the chatroom")
@@ -473,7 +565,7 @@ def main():
     p_poll.add_argument("--room", default="general", help="Room name (default: general)")
     p_poll.add_argument("--since", type=float, help="Only messages after this Unix timestamp")
     p_poll.add_argument("--last", type=int, default=20, help="Show last N messages (default: 20)")
-    p_poll.add_argument("--timeout", type=int, default=300, help="How long to wait for new messages in seconds (default: 300)")
+    p_poll.add_argument("--timeout", type=int, default=100, help="How long to wait for new messages in seconds (default: 100)")
     p_poll.add_argument("--no-wait", action="store_true", help="Return immediately instead of blocking for new messages")
     p_poll.add_argument("--mentions", help="Only show messages that @mention this name")
 
@@ -493,6 +585,10 @@ def main():
     p_cr = sub.add_parser("create-room", help="Create a new room")
     p_cr.add_argument("--room", required=True, help="Room name")
 
+    # ui
+    p_ui = sub.add_parser("ui", help="Open the Tk chat window (for humans)")
+    p_ui.add_argument("--name", default="doug", help="Your display name (default: doug)")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -509,6 +605,7 @@ def main():
         "members": cmd_members,
         "rooms": cmd_rooms,
         "create-room": cmd_create_room,
+        "ui": cmd_ui,
     }
     commands[args.command](args)
 
