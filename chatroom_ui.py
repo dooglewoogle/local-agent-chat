@@ -32,6 +32,9 @@ BG_ALT = "#1b2a4a"
 FG = "#f2f4f8"
 DIM = "#9aa5b8"
 MENTION_BG = "#4a3a1a"
+AT_FG = "#f5d76e"
+# Any @token, best effort: it need not resolve to a registered member.
+AT_RE = re.compile(r"(?<![\w.])@[\w][\w-]*(?:\.[\w-]+)*")
 PALETTE = ["#8fb8ff", "#f0a35e", "#d99bf5", "#6fd3c7", "#f5d76e", "#ff9aa2", "#a8c686", "#c8b7a6"]
 
 
@@ -98,6 +101,7 @@ class Pane:
         self.text.tag_configure("ts", foreground=DIM)
         self.text.tag_configure("mention", background=MENTION_BG)
         self.text.tag_configure("arrow", foreground=DIM)
+        self.text.tag_configure("at", foreground=AT_FG, font=app.bold)
         app.nb.add(self.frame, text=title)
 
     def add_path(self, path: Path):
@@ -142,10 +146,13 @@ class Pane:
         if self.kind == "alldm":
             self.text.insert("end", f" → {m.get('to', '?')}", "arrow")
         self.text.insert("end", ": ")
-        if self.app.mention_re.search(msg):
-            self.text.insert("end", msg + "\n", "mention")
-        else:
-            self.text.insert("end", msg + "\n")
+        line_tags = ("mention",) if self.app.mention_re.search(msg) else ()
+        pos = 0
+        for m in AT_RE.finditer(msg):
+            self.text.insert("end", msg[pos:m.start()], line_tags)
+            self.text.insert("end", m.group(0), ("at",) + line_tags)
+            pos = m.end()
+        self.text.insert("end", msg[pos:] + "\n", line_tags)
         self.text.configure(state="disabled")
         if at_bottom:
             self.text.see("end")
