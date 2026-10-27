@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Tk chat window for a human participant in the agent chatroom.
 
-Launch: python3 chatroom.py ui [--name doug]   or   python3 chatroom_ui.py [--name doug]
+Launch: chatroom ui [--name NAME]   or   python3 chatroom_ui.py [--name NAME]
+(NAME defaults to $CHATROOM_NAME, else your login name.)
 
 Stdlib only. Tails the jsonl files by byte offset on a 500 ms timer (no threads,
 no inotify), discovers new rooms / DM threads / members every 2 s, and writes
@@ -167,7 +168,7 @@ class App:
     def __init__(self, root: tk.Tk, name: str):
         self.root = root
         self.me = cr.validate_name(name)
-        self.mention_re = re.compile(r"(?<![\w-])@?" + re.escape(self.me) + r"(?![\w-])", re.IGNORECASE)
+        self.mention_re = cr.mention_pattern(self.me)
         self.panes = {}  # key -> Pane
         self.ticks = 0
 
@@ -287,10 +288,7 @@ class App:
                 partner = parts[1] if parts[0] == self.me else parts[0]
                 if f"dm:{partner}" not in self.panes:
                     new_panes.append(self.ensure_dm(partner))
-            if f not in alldm.tails:
-                alldm.add_path(f)
-                if self.ticks:  # after startup, show the new thread's history as unread
-                    pass
+            alldm.add_path(f)
         if alldm not in new_panes and not self.ticks:
             new_panes.append(alldm)
         return new_panes
@@ -361,13 +359,10 @@ class App:
         if not name:
             return
         name = name.strip().lstrip("#")
-        if not name or "/" in name or name in (".", ".."):
-            self.set_status("Invalid room name.")
+        if not cr.is_valid_name(name):
+            self.set_status("Invalid room name: must be non-empty and contain no '/' or '--'.")
             return
-        rp = cr.room_path(name)
-        if not rp.exists():
-            rp.mkdir(parents=True)
-            cr.messages_path(name).touch()
+        cr.create_room(name)
         self.nb.select(self.ensure_room(name).frame)
 
     def close(self):
@@ -381,15 +376,15 @@ class App:
         self.root.destroy()
 
 
-def run(name: str = "doug"):
+def run(name: str = None):
     root = tk.Tk()
-    App(root, name)
+    App(root, name or cr.default_human_name())
     root.mainloop()
 
 
 def main():
     ap = argparse.ArgumentParser(description="Tk chat window for the agent chatroom.")
-    ap.add_argument("--name", default="doug", help="Your display name (default: doug)")
+    ap.add_argument("--name", help="Your display name (default: $CHATROOM_NAME, else your login name)")
     run(ap.parse_args().name)
 
 

@@ -6,11 +6,14 @@ live data/ directory that agents on this machine use is never touched.
     python3 -m unittest discover -s tests -v
 """
 
+import getpass
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -96,6 +99,65 @@ class MessagingTest(ChatroomTestCase):
         self.assertIn("ping doug.", r.stdout)
         self.assertNotIn("dougal", r.stdout)
         self.assertNotIn("sony-doug", r.stdout)
+
+    def test_blocking_poll_wakes_on_new_message(self):
+        self.run_cli("send", "--name", "a", "-m", "first")
+        proc = subprocess.Popen(
+            [sys.executable, str(self.root / "chatroom.py"), "poll", "--timeout", "20"],
+            stdout=subprocess.PIPE, text=True,
+        )
+        try:
+            self.assertIn("first", proc.stdout.readline())  # history printed, now waiting
+            start = time.monotonic()
+            self.run_cli("send", "--name", "a", "-m", "second")
+            out, _ = proc.communicate(timeout=10)
+            self.assertIn("second", out)
+            self.assertLess(time.monotonic() - start, 1.5)
+        finally:
+            proc.kill()
+            proc.wait()
+
+    def test_blocking_dm_poll_times_out_quietly(self):
+        self.join("a")
+        self.join("b")
+        r = self.run_cli("dm-poll", "--name", "a", "--with", "b", "--timeout", "1")
+        self.assertIn("No new messages in DM with b (waited 1s)", r.stdout)
+
+
+class PresenceTest(ChatroomTestCase):
+    def write_presence(self, name, **fields):
+        presence = self.data / "presence"
+        presence.mkdir(parents=True, exist_ok=True)
+        (presence / f"{name}.json").write_text(json.dumps({"name": name, "agent": "test", **fields}))
+
+    def test_pidless_presence_expires_after_ttl(self):
+        self.write_presence("fresh", pid=None, last_seen=time.time())
+        self.write_presence("stale", pid=None, last_seen=time.time() - 4 * 3600)
+        r = self.run_cli("members")
+        self.assertIn("Reaped stale agents: stale", r.stdout)
+        self.assertIn("fresh", r.stdout)
+
+    def test_reap_keeps_live_pid(self):
+        self.join("alive")
+        self.write_presence("dead", pid=2 ** 22 + 12345)  # above pid_max, never a real process
+        r = self.run_cli("reap")
+        self.assertIn("Reaped stale agent: dead", r.stdout)
+        self.assertTrue((self.data / "presence" / "alive.json").exists())
+
+
+class MiscTest(ChatroomTestCase):
+    def test_guide_prints_agents_md(self):
+        r = self.run_cli("guide")
+        self.assertEqual(r.stdout, (REPO / "AGENTS.md").read_text())
+
+    def test_default_human_name(self):
+        code = "import chatroom; print(chatroom.default_human_name())"
+        env = dict(os.environ, CHATROOM_NAME="alice")
+        r = subprocess.run([sys.executable, "-c", code], cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), "alice")
+        env.pop("CHATROOM_NAME")
+        r = subprocess.run([sys.executable, "-c", code], cwd=self.root, env=env, capture_output=True, text=True)
+        self.assertEqual(r.stdout.strip(), getpass.getuser())
 
 
 if __name__ == "__main__":
